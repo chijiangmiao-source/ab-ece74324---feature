@@ -137,10 +137,52 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
 
             clean_hits.append(hit)
 
+    # dead_times 可选：与 detectors 对齐的非负整数，且各不大于 window。
+    # 缺省（不带该字段）保持原有语义；只要提供就整体校验，非法值按下标报错。
+    clean_dead_times: List[int] | None = None
+    if "dead_times" in payload:
+        raw_dead = payload.get("dead_times")
+        if not isinstance(raw_dead, list):
+            errors.append({
+                "path": "dead_times",
+                "message": "dead_times must be an array",
+            })
+        else:
+            # 长度与原始 detectors 声明对齐（即使其中有非法探测器项）
+            if isinstance(detectors, list) and len(raw_dead) != len(detectors):
+                errors.append({
+                    "path": "dead_times",
+                    "message": "dead_times must align with detectors"
+                    " (same length)",
+                })
+            window_ok = _is_int(window) and window >= 0
+            clean_dead_times = []
+            for k, dt in enumerate(raw_dead):
+                if not _is_int(dt) or dt < 0:
+                    errors.append({
+                        "path": f"dead_times[{k}]",
+                        "message": "dead time must be a non-negative integer",
+                    })
+                elif window_ok and dt > window:
+                    errors.append({
+                        "path": f"dead_times[{k}]",
+                        "message": "dead time must not exceed the"
+                        " coincidence window",
+                    })
+                else:
+                    clean_dead_times.append(dt)
+            if errors:
+                clean_dead_times = None
+
     if errors:
         return errors, None
 
-    clean = {"window": window, "detectors": det_values, "hits": clean_hits}
+    clean = {
+        "window": window,
+        "detectors": det_values,
+        "hits": clean_hits,
+        "dead_times": clean_dead_times,
+    }
     return [], clean
 
 
@@ -157,7 +199,14 @@ def _run(clean: Dict[str, Any]) -> Dict[str, Any]:
     weights = [h["confidence"] for h in sorted_hits]
     ids = [h["id"] for h in sorted_hits]
 
-    result = solve(times, detectors, weights, window, id_order=ids)
+    result = solve(
+        times,
+        detectors,
+        weights,
+        window,
+        id_order=ids,
+        dead_times=clean.get("dead_times"),
+    )
 
     canonical_groups = [
         sorted(ids[j] for j in group) for group in result["canonical"]

@@ -96,6 +96,32 @@ def algorithm_checks() -> None:
     check("attribution: always pair count equals total",
           r2["pair_count"].get((0, 1)) == r2["total_count"] == 1)
 
+    # 5) 恢复期：边界相等算冲突（差 == D 非法，差 > D 合法）
+    #    A@0,B@0,A@2,B@2：D_A=2 时两个 A 不能双双入组
+    rd = solve([0, 0, 2, 2], [0, 1, 0, 1], [10] * 4, 2,
+               id_order=["a0", "b0", "a1", "b1"], dead_times=[2, 0])
+    check("deadtime: equal boundary is a conflict",
+          rd["best_score"] == 20 and rd["best_events"] == 1)
+    rd1 = solve([0, 0, 2, 2], [0, 1, 0, 1], [10] * 4, 2,
+                id_order=["a0", "b0", "a1", "b1"], dead_times=[1, 0])
+    check("deadtime: gap strictly greater than D is allowed",
+          rd1["best_score"] == 40 and rd1["best_events"] == 2)
+
+    # 6) 恢复期：噪声不触发恢复（A@1 噪声不影响 A@0/A@2 入组）
+    rn = solve([0, 0, 1, 2, 2], [0, 1, 0, 0, 2],
+               [100, 100, 1, 100, 100], 2,
+               id_order=["a0", "b0", "ax", "a1", "c1"],
+               dead_times=[1, 0, 0])
+    check("deadtime: noise does not trigger recovery",
+          rn["best_score"] == 400 and rn["best_events"] == 2)
+
+    # 7) 恢复期联合求解：无恢复时双事件 300，D_A=W 使两个 A 冲突，
+    #    最优须重算（双事件方案不可“先分组再删事件”）。
+    rj = solve([0, 1, 2, 5], [0, 1, 1, 0], [50, 100, 100, 50], 5,
+               id_order=["a0", "b0", "b1", "a1"], dead_times=[5, 0])
+    check("deadtime: occupancy enforced jointly across candidate events",
+          rj["best_score"] == 150 and rj["best_events"] == 1)
+
 
 # ---------------------------------------------------------------- 测试套件
 def run_tests() -> None:
@@ -165,6 +191,35 @@ def http_smoke() -> None:
     status, body = _request("POST", "/audit", edge)
     check("http: closed window boundary over API",
           status == 200 and body["optimal_confidence"] == 15)
+
+    # 恢复期：A@0,B@0,A@2,B@2，D=W=2 边界冲突使双事件不可行
+    dt_payload = {
+        "window": 2,
+        "detectors": ["A", "B"],
+        "dead_times": [2, 2],
+        "hits": [
+            {"id": "a0", "detector": "A", "time": 0, "confidence": 10},
+            {"id": "b0", "detector": "B", "time": 0, "confidence": 10},
+            {"id": "a1", "detector": "A", "time": 2, "confidence": 10},
+            {"id": "b1", "detector": "B", "time": 2, "confidence": 10},
+        ],
+    }
+    status, body = _request("POST", "/audit", dt_payload)
+    check("http: dead times enforced over API",
+          status == 200 and body["optimal_confidence"] == 20
+          and body["event_count"] == 1)
+
+    # 非法恢复期：按下标报错且不夹带结果
+    bad_dt = dict(dt_payload, dead_times=[2, 3])
+    try:
+        status, body = _request("POST", "/audit", bad_dt)
+        check("http: invalid dead time rejected", False, f"status {status}")
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode())
+        paths = {e["path"] for e in body.get("errors", [])}
+        check("http: dead time errors by subscript without results",
+              exc.code == 400 and "dead_times[1]" in paths
+              and "optimal_confidence" not in body)
 
     # 字段错误：按路径返回且不得夹带结果
     bad = {"window": -1, "detectors": ["A"], "hits": []}

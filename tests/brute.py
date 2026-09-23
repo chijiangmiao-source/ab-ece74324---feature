@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.solver import _sweep_groups
 
@@ -12,15 +12,31 @@ def brute_solve(
     detectors: Sequence[int],
     weights: Sequence[int],
     window: int,
+    dead_times: Optional[Sequence[int]] = None,
 ) -> dict:
     n = len(times)
     groups = _sweep_groups(times, detectors, window)
+
+    def group_dead_ok(g: Tuple[int, ...], used_mask: int) -> bool:
+        """与所有“已归入事件”的命中做两两恢复检查（噪声不在其中）。"""
+        if dead_times is None:
+            return True
+        used = used_mask
+        while used:
+            bit = used & -used
+            k = bit.bit_length() - 1
+            used ^= bit
+            for j in g:
+                if detectors[j] == detectors[k] and abs(times[j] - times[k]) <= dead_times[detectors[j]]:
+                    return False
+        return True
 
     best_score = 0
     best_events = 0
     packings: List[Tuple[Tuple[int, ...], ...]] = []
 
-    def rec(i: int, used_mask: int, chosen: List[Tuple[int, ...]], score: int) -> None:
+    def rec(i: int, used_mask: int, chosen: List[Tuple[int, ...]],
+            score: int) -> None:
         nonlocal best_score, best_events, packings
         while i < n and (used_mask & (1 << i)):
             i += 1
@@ -36,7 +52,7 @@ def brute_solve(
                 elif events == best_events:
                     packings.append(tuple(chosen))
             return
-        # i 作为噪声
+        # i 作为噪声（噪声不触发恢复）
         rec(i + 1, used_mask, chosen, score)
         # 以 i 为锚点建事件
         for g in groups[i]:
@@ -46,6 +62,8 @@ def brute_solve(
                 gm |= 1 << j
                 gain += weights[j]
             if used_mask & gm:
+                continue
+            if not group_dead_ok(g, used_mask):
                 continue
             chosen.append(g)
             rec(i + 1, used_mask | gm, chosen, score + gain)

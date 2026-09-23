@@ -12,6 +12,24 @@
 ``[t_i, t_i+W]`` 内，至多 10 个。因此 DP 状态是至多 10 位的位掩码
 （每步至多 1024 个状态），整体为 O(n * 2^10 * 2^10) 上界内的扫描线
 动态规划，不枚举任何完整分组方案。方案计数为 Python 任意精度整数。
+
+探测器恢复期（dead time）
+------------------------
+``dead_times[d]`` 给出探测器 d 的非负恢复期 D_d（D_d ≤ W）。同一探测器
+任意两个“归入事件”的命中时刻差必须严格大于 D_d（相等即冲突）；噪声命中
+不触发恢复。启用后每个扫描状态维护两个互不相交的 ≤10 位掩码：
+
+- ``occ``：已被早先事件占用的命中（归入事件，扫描到达时强制为噪声并
+  触发自身恢复）；
+- ``blk``：被某个已分组同探测器命中的恢复封锁的命中（强制为噪声，
+  自身不触发恢复）。
+
+建事件转移额外要求事件成员与 occ 中同探测器命中的时刻差严格大于各自
+恢复期（预计算冲突掩码），于是恢复约束在“选择事件”时即被联合维护，
+无需先求无恢复最优解再删除冲突事件。状态数上界为 3^10（每窗至多 10 个
+命中，各自空闲 / 占用 / 封锁三态），仍不枚举任何完整分组或恢复历史。
+未提供 ``dead_times`` 时所有恢复位置零，退化为单掩码引擎，语义与旧版
+完全一致。
 """
 
 from __future__ import annotations
@@ -98,15 +116,21 @@ def solve(
     weights: Sequence[int],
     window: int,
     id_order: Optional[Sequence[str]] = None,
+    dead_times: Optional[Sequence[int]] = None,
 ) -> dict:
     """计算最优分组、规范解、任意精度方案数与成对归属。
 
     调用前输入已按 (时刻, 标识) 稳定排序；id_order 给出排序后的标识，
     用于规范解的词典序比较（若为 None 则按下标比较）。
+
+    ``dead_times`` 为 None 时不启用恢复期（与旧语义完全一致）；否则须与
+    探测器声明对齐，各值为不超过 window 的非负整数。
     """
     n = len(times)
     if n == 0:
         raise SolveError("no hits")
+    # dead_times 由调用方保证与探测器声明对齐：下标即探测器编号，
+    # 命中里出现的探测器编号都在其范围内。
 
     groups = _sweep_groups(times, detectors, window)
     opens = _open_members(times, window)
@@ -140,82 +164,152 @@ def solve(
         dict(zip(group_masks[i], group_gains[i])) for i in range(n)
     ]
 
-    def iter_event_masks(mask: int, i: int):
-        """枚举在待决议占用 mask 下、以 i 为锚点可创建的事件 (gm, gain)。
+    # ---------- 恢复期数据 ----------
+    # rec_bits[i]：命中 i 归入事件后触发的恢复封锁位——同窗内、同探测器、
+    # 时刻差 0 < t_j - t_i <= D_d 的未来下标 j（边界相等算冲突，故取 ≤）。
+    # D_d ≤ W，故所有相关 j 都在 opens[i] 内。
+    # block_maps[i][gm]：候选事件 gm 与 occ 中已占用命中发生恢复冲突的位：
+    # 成员 j 与同探测器命中 k 的时刻差 |t_j-t_k| ≤ D_d 时 k 入掩码。
+    n_det = len(set(detectors))
+    if dead_times is None:
+        rec_bits = [0] * n
+        block_maps: List[Dict[int, int]] = [
+            {m: 0 for m in group_masks[i]} for i in range(n)
+        ]
+    else:
+        rec_bits = [0] * n
+        # 先求每个 (i, j∈open(i)) 的同探测器恢复冲突位
+        conflict_bits: List[Dict[int, int]] = [{} for _ in range(n)]
+        for i in range(n):
+            members = opens[i]
+            cb = conflict_bits[i]
+            for j in members:
+                dj = detectors[j]
+                dline = dead_times[dj]
+                m = 0
+                tj = times[j]
+                for k in members:
+                    if k != j and detectors[k] == dj and abs(times[k] - tj) <= dline:
+                        m |= 1 << k
+                cb[j] = m
+            # rec_bits[i] 只含未来位
+            rec_bits[i] = conflict_bits[i].get(i, 0)
+        block_maps = []
+        for i in range(n):
+            cb = conflict_bits[i]
+            bm: Dict[int, int] = {}
+            for gm in group_masks[i]:
+                blocked = 0
+                m = gm
+                while m:
+                    bit = m & -m
+                    blocked |= cb[bit.bit_length() - 1]
+                    m ^= bit
+                bm[gm] = blocked
+            block_maps.append(bm)
 
-        仅枚举“未被占用的开放命中（锚点除外）”的子掩码，
-        三态计数 3^(k-1)（k≤10）。
+    # 状态编码：单整数 key = occ | (blk << n)；occ、blk 互不相交。
+    SH = n
+    LOW = (1 << n) - 1
+
+    def _key(occ: int, blk: int) -> int:
+        return occ | (blk << SH)
+
+    def iter_event_masks(occ: int, blk: int, i: int):
+        """枚举在占用/封锁掩码下、以 i 为锚点可创建的事件 (gm, gain)。
+
+        仅枚举“既未占用也未封锁的开放命中（锚点除外）”的子掩码，
+        三态计数 3^(k-1)（k≤10）；另以恢复冲突掩码拒绝与已占用命中
+        时差不超过各自恢复期的候选。
         """
         bit_i = 1 << i
-        free = open_masks[i] & ~mask & ~bit_i
+        free = open_masks[i] & ~occ & ~blk & ~bit_i
+        bm = block_maps[i]
         s = free
         while True:
             gm = s | bit_i
             gain = gain_maps[i].get(gm)
-            if gain is not None:
+            if gain is not None and not (occ & bm[gm]):
                 yield gm, gain
             if s == 0:
                 break
             s = (s - 1) & free
 
+    def _merge(nxt: Dict[int, _Cell], key: int, cell: _Cell) -> None:
+        old = nxt.get(key)
+        if old is None:
+            nxt[key] = cell
+        elif _better(cell, old):
+            nxt[key] = cell
+        elif not _better(old, cell):
+            nxt[key] = (old[0], old[1], old[2] + cell[2])
+
     # ---------- 前向 DP ----------
-    # F[i][mask]：处理完前 i 个命中后，待决议占用掩码为 mask 时的
+    # F[i][key]：处理完前 i 个命中后，待决议占用/封锁掩码为 (occ, blk) 时的
     # (已锁定可信度和, 已锁定事件数, 方案数)。
     forward: List[Dict[int, _Cell]] = [{0: (0, 0, 1)}]
     for i in range(n):
         cur = forward[i]
         nxt: Dict[int, _Cell] = {}
         bit_i = 1 << i
-        for mask, (sc, ev, cnt) in cur.items():
-            # 选择一：i 作为噪声（若 i 已被早先事件占用则强制此路）
-            nm = mask & ~bit_i
-            cell = (sc, ev, cnt)
-            old = nxt.get(nm)
-            if old is None:
-                nxt[nm] = cell
-            elif _better(cell, old):
-                nxt[nm] = cell
-            elif not _better(old, cell):
-                nxt[nm] = (old[0], old[1], old[2] + cnt)
-            if mask & bit_i:
+        ri = rec_bits[i]
+        for key, (sc, ev, cnt) in cur.items():
+            occ = key & LOW
+            blk = key >> SH
+            if occ & bit_i:
+                # i 已被早先事件占用：归入事件，强制噪声并触发恢复。
+                # 与另一已占用命中冲突（理论上建事件时已拦住）则丢弃。
+                if ri & occ:
+                    continue
+                nk = _key(occ & ~bit_i, (blk | ri) & ~bit_i)
+                _merge(nxt, nk, (sc, ev, cnt))
+                continue
+            # 选择一：i 作为噪声（被恢复封锁时同样走此路，且不触发恢复）
+            nk = _key(occ & ~bit_i, blk & ~bit_i)
+            _merge(nxt, nk, (sc, ev, cnt))
+            if blk & bit_i:
                 continue
             # 选择二：以 i 为锚点创建事件（枚举空闲开放位的子掩码）
-            for gm, gain in iter_event_masks(mask, i):
-                nm2 = (mask | gm) & ~bit_i
-                cell2 = (sc + gain, ev + 1, cnt)
-                old2 = nxt.get(nm2)
-                if old2 is None:
-                    nxt[nm2] = cell2
-                elif _better(cell2, old2):
-                    nxt[nm2] = cell2
-                elif not _better(old2, cell2):
-                    nxt[nm2] = (old2[0], old2[1], old2[2] + cnt)
+            for gm, gain in iter_event_masks(occ, blk, i):
+                # 锚点 i 归入事件，立即触发其恢复；与 occ 的冲突已由
+                # block_maps 拦住（含成员 i 自身的同探测器冲突）。
+                nk = _key((occ | gm) & ~bit_i, (blk | ri) & ~bit_i)
+                _merge(nxt, nk, (sc + gain, ev + 1, cnt))
         forward.append(nxt)
 
     final = forward[n][0]
     best_score, best_events, total_count = final
 
     # ---------- 后向 DP ----------
-    # B[i][mask]：从步骤 i、待决议掩码 mask 出发，后缀可达的
-    # (可信度和, 事件数, 方案数) 最优值。只需前向可达的掩码（每步 ≤ 1024）。
+    # B[i][key]：从步骤 i、掩码 (occ, blk) 出发，后缀可达的
+    # (可信度和, 事件数, 方案数) 最优值。只需前向可达的掩码（每步 ≤ 3^10）。
     backward: List[Dict[int, _Cell]] = [{} for _ in range(n + 1)]
     backward[n] = {0: (0, 0, 1)}
     for i in range(n - 1, -1, -1):
         table: Dict[int, _Cell] = {}
         bit_i = 1 << i
+        ri = rec_bits[i]
         b_next = backward[i + 1]
-        for mask in forward[i]:
-            # 选择一：噪声（被占用时为强制转移）
-            best: Optional[_Cell] = None
-            nm0 = mask & ~bit_i
-            suffix = b_next.get(nm0)
-            if suffix is not None:
-                best = suffix
-            if not (mask & bit_i):
+        for key in forward[i]:
+            occ = key & LOW
+            blk = key >> SH
+            if occ & bit_i:
+                if ri & occ:
+                    continue
+                nk = _key(occ & ~bit_i, (blk | ri) & ~bit_i)
+                suffix = b_next.get(nk)
+                if suffix is not None:
+                    table[key] = suffix
+                continue
+            # 选择一：噪声（被封锁时为强制转移）
+            best: Optional[_Cell] = b_next.get(
+                _key(occ & ~bit_i, blk & ~bit_i)
+            )
+            if not (blk & bit_i):
                 # 选择二：以 i 为锚点创建事件（枚举空闲开放位的子掩码）
-                for gm, gain in iter_event_masks(mask, i):
-                    nm = (mask | gm) & ~bit_i
-                    suffix = b_next.get(nm)
+                for gm, gain in iter_event_masks(occ, blk, i):
+                    nk = _key((occ | gm) & ~bit_i, (blk | ri) & ~bit_i)
+                    suffix = b_next.get(nk)
                     if suffix is None:
                         continue
                     cell = (suffix[0] + gain, suffix[1] + 1, suffix[2])
@@ -224,16 +318,16 @@ def solve(
                     elif not _better(best, cell):
                         best = (best[0], best[1], best[2] + cell[2])
             if best is not None:
-                table[mask] = best
+                table[key] = best
         backward[i] = table
 
     # ---------- 规范解（词典序裁决） ----------
-    # 对每个可达状态 (i, mask) 求后缀的“成员标识排序后的事件序列”
+    # 对每个可达状态 (i, occ, blk) 求后缀的“成员标识排序后的事件序列”
     # 的词典序最小值（仅限达到该状态最优 (可信度, 事件数) 的转移）。
     # 事件在锚点处加入，与后缀已排序序列做单点插入后比较。
     # 预生成每个候选事件的比较键（按掩码索引）。
     # 有标识序列时按标识（字符串元组）裁决，否则直接按下标（整数元组）。
-    def _key(j: int):
+    def _idkey(j: int):
         return id_order[j] if id_order is not None else j
 
     group_by_mask: List[Dict[int, Tuple[int, ...]]] = [
@@ -242,7 +336,7 @@ def solve(
     ]
     gm_to_keys: List[Dict[int, Tuple[object, ...]]] = [
         {
-            m: tuple(_key(j) for j in g)
+            m: tuple(_idkey(j) for j in g)
             for g, m in zip(groups[i], group_masks[i])
         }
         for i in range(n)
@@ -251,30 +345,33 @@ def solve(
     memo: Dict[Tuple[int, int], Tuple[Tuple[object, ...], ...]] = {}
 
     def canonical_suffix(
-        i: int, mask: int
+        i: int, key: int
     ) -> Tuple[Tuple[object, ...], ...]:
         if i == n:
             return ()
-        key = (i, mask)
-        if key in memo:
-            return memo[key]
-        target = backward[i][mask]
+        memo_key = (i, key)
+        if memo_key in memo:
+            return memo[memo_key]
+        occ = key & LOW
+        blk = key >> SH
+        target = backward[i][key]
         bit_i = 1 << i
+        ri = rec_bits[i]
         best_seq: Optional[Tuple[Tuple[object, ...], ...]] = None
 
         def consider(
             gain: int,
             events_added: int,
-            nm: int,
+            nk: int,
             inserted: Optional[Tuple[object, ...]],
         ) -> None:
             nonlocal best_seq
-            suf = backward[i + 1].get(nm)
+            suf = backward[i + 1].get(nk)
             if suf is None:
                 return
             if gain + suf[0] != target[0] or events_added + suf[1] != target[1]:
                 return
-            suffix_seq = canonical_suffix(i + 1, nm)
+            suffix_seq = canonical_suffix(i + 1, nk)
             if inserted is None:
                 cand = suffix_seq
             else:
@@ -291,15 +388,22 @@ def solve(
             if best_seq is None or cand < best_seq:
                 best_seq = cand
 
-        # 噪声（被占用时为强制转移）
-        consider(0, 0, mask & ~bit_i, None)
-        if not (mask & bit_i):
-            for gm, gain in iter_event_masks(mask, i):
-                nm = (mask | gm) & ~bit_i
-                consider(gain, 1, nm, gm_to_keys[i][gm])
+        if occ & bit_i:
+            # 占用命中：唯一强制转移，触发恢复
+            if not (ri & occ):
+                nk = _key(occ & ~bit_i, (blk | ri) & ~bit_i)
+                if backward[i + 1].get(nk) is not None:
+                    consider(0, 0, nk, None)
+        else:
+            # 噪声（被封锁时为强制转移）
+            consider(0, 0, _key(occ & ~bit_i, blk & ~bit_i), None)
+            if not (blk & bit_i):
+                for gm, gain in iter_event_masks(occ, blk, i):
+                    nk = _key((occ | gm) & ~bit_i, (blk | ri) & ~bit_i)
+                    consider(gain, 1, nk, gm_to_keys[i][gm])
 
         assert best_seq is not None
-        memo[key] = best_seq
+        memo[memo_key] = best_seq
         return best_seq
 
     canonical_seq = canonical_suffix(0, 0)
@@ -313,17 +417,22 @@ def solve(
         canonical_groups = [tuple(gt) for gt in canonical_seq]
 
     # ---------- 逐事件 / 逐对在最优解中的出现次数 ----------
+    # 前向方案数 × 后向方案数，前/后向共享同一 (occ, blk) 状态语义。
     member_count: Dict[int, int] = {}
     pair_count: Dict[Tuple[int, int], int] = {}
     for i in range(n):
         f_table = forward[i]
         b_next = backward[i + 1]
-        for fmask, (fsc, fev, fcnt) in f_table.items():
-            if fmask & (1 << i):
+        bit_i = 1 << i
+        ri = rec_bits[i]
+        for fkey, (fsc, fev, fcnt) in f_table.items():
+            occ = fkey & LOW
+            blk = fkey >> SH
+            if occ & bit_i or blk & bit_i:
                 continue
-            for gm, gain in iter_event_masks(fmask, i):
-                nm = (fmask | gm) & ~(1 << i)
-                suf = b_next.get(nm)
+            for gm, gain in iter_event_masks(occ, blk, i):
+                nk = _key((occ | gm) & ~bit_i, (blk | ri) & ~bit_i)
+                suf = b_next.get(nk)
                 if suf is None:
                     continue
                 if fsc + gain + suf[0] != best_score:
