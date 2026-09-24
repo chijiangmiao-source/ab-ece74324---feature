@@ -96,6 +96,25 @@ def algorithm_checks() -> None:
     check("attribution: always pair count equals total",
           r2["pair_count"].get((0, 1)) == r2["total_count"] == 1)
 
+    # 5) 恢复期：边界相等为冲突，严格大于才放行；噪声不触发恢复
+    rd = solve([0, 0, 2, 2], [0, 1, 0, 1], [1, 1, 1, 1], 2,
+               id_order=["a", "b", "c", "d"], dead_times=[2, 2])
+    check("deadtime: equal-gap conflict forces one event",
+          rd["best_score"] == 2 and rd["best_events"] == 1)
+    rd2 = solve([0, 0, 3, 3], [0, 1, 0, 1], [1, 1, 1, 1], 3,
+                id_order=["a", "b", "c", "d"], dead_times=[2, 2])
+    check("deadtime: strictly larger gap allows two events",
+          rd2["best_score"] == 4 and rd2["best_events"] == 2)
+    rd3 = solve([0, 1, 2, 3], [0, 1, 0, 1], [1, 100, 100, 100], 3,
+                id_order=["a", "b", "c", "d"], dead_times=[2, 2])
+    check("deadtime: noise does not trigger recovery",
+          rd3["best_score"] == 200 and 0 not in rd3["member_count"])
+    # 缺省语义不变：同探测器命中仍可分属两个事件
+    rd4 = solve([0, 0, 2, 2], [0, 1, 0, 1], [1, 1, 1, 1], 2,
+                id_order=["a", "b", "c", "d"])
+    check("deadtime: omitted field keeps old semantics",
+          rd4["best_score"] == 4 and rd4["best_events"] == 2)
+
 
 # ---------------------------------------------------------------- 测试套件
 def run_tests() -> None:
@@ -178,6 +197,37 @@ def http_smoke() -> None:
               exc.code == 400
               and {"window", "detectors", "hits"} <= paths
               and "optimal_confidence" not in body)
+
+    # 恢复期：边界相等为冲突
+    dt_payload = {
+        "window": 3,
+        "detectors": ["A", "B"],
+        "dead_times": [2, 2],
+        "hits": [
+            {"id": "a1", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "b1", "detector": "B", "time": 1, "confidence": 5},
+            {"id": "a2", "detector": "A", "time": 2, "confidence": 5},
+            {"id": "b2", "detector": "B", "time": 3, "confidence": 5},
+        ],
+    }
+    status, body = _request("POST", "/audit", dt_payload)
+    check("http: dead time enforced over API",
+          status == 200
+          and body["optimal_confidence"] == 10
+          and body["event_count"] == 1
+          and body["solution_count"] == "4", json.dumps(body))
+    # 非法恢复期：按下标报错且不夹带结果
+    dt_bad = dict(dt_payload, dead_times=[2, 9])
+    try:
+        status, body = _request("POST", "/audit", dt_bad)
+        check("http: dead time above window rejected", False, str(status))
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode())
+        paths = {e["path"] for e in body.get("errors", [])}
+        check("http: dead time errors by index without results",
+              exc.code == 400 and paths == {"dead_times[1]"}
+              and "optimal_confidence" not in body)
+    # 不带该字段的请求内容保持不变（窗口边界用例已在上面覆盖）
 
 
 def main() -> int:

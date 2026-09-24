@@ -156,3 +156,143 @@ def test_dense_window_rejected_via_solver():
     except SolveError:
         return
     raise AssertionError("expected SolveError")
+
+
+# ---------------------------------------------------------------- 恢复期
+
+
+def test_dead_time_boundary_equality_is_conflict():
+    # 同探测器命中时刻差恰好等于恢复期 -> 不得分属两个事件
+    times = [0, 0, 2, 2]
+    detectors = [0, 1, 0, 1]
+    weights = [1, 1, 1, 1]
+    no_dt = solve(times, detectors, weights, 2, id_order=_ids(4))
+    assert no_dt["best_score"] == 4  # 两个二元事件
+    with_dt = solve(
+        times, detectors, weights, 2, id_order=_ids(4),
+        dead_times=[2, 2],
+    )
+    assert with_dt["best_score"] == 2  # 至多一个事件
+    assert with_dt["best_events"] == 1
+
+
+def test_dead_time_strictly_greater_gap_allowed():
+    # 时刻差 d+1（严格大于）允许分属两个事件
+    times = [0, 0, 3, 3]
+    detectors = [0, 1, 0, 1]
+    weights = [1, 1, 1, 1]
+    got = solve(
+        times, detectors, weights, 3, id_order=_ids(4),
+        dead_times=[2, 2],
+    )
+    assert got["best_score"] == 4
+    assert got["best_events"] == 2
+
+
+def test_dead_time_zero_blocks_same_timestamp():
+    # 显式 d=0：同刻同探测器的两个命中不能分属两个事件
+    times = [0, 0, 0, 0]
+    detectors = [0, 0, 1, 1]
+    weights = [1, 1, 1, 1]
+    absent = solve(times, detectors, weights, 0, id_order=_ids(4))
+    assert absent["best_score"] == 4  # 未提供：两个事件
+    enabled = solve(
+        times, detectors, weights, 0, id_order=_ids(4),
+        dead_times=[0, 0],
+    )
+    assert enabled["best_score"] == 2  # 每探测器只一个命中可分组
+    assert enabled["best_events"] == 1
+
+
+def test_noise_does_not_trigger_recovery():
+    # A@0(低权) 作噪声时不得阻塞 A@2：最优把 A@0 丢弃，
+    # 事件 (B@1, A@2) 拿到 200；若噪声也触发恢复则至多 101。
+    times = [0, 1, 2, 3]
+    detectors = [0, 1, 0, 1]
+    weights = [1, 100, 100, 100]
+    got = solve(
+        times, detectors, weights, 3, id_order=_ids(4),
+        dead_times=[2, 2],
+    )
+    assert got["best_score"] == 200
+    assert got["canonical"] == [(1, 2)]
+    # A@0 从不出现在任何最优事件中
+    assert 0 not in got["member_count"]
+
+
+def test_dead_time_spans_multiple_candidate_events():
+    # 链式候选：A 在 t=0 被分组后，恢复期 d=4 跨越 t=2、t=4 两个
+    # 候选事件位置，只有 t=5 的 A 命中可再次分组。
+    times = [0, 1, 2, 3, 4, 5]
+    detectors = [0, 1, 1, 1, 1, 0]
+    weights = [10] * 6
+    got = solve(
+        times, detectors, weights, 5, id_order=_ids(6),
+        dead_times=[4, 0],
+    )
+    # (A0, 某个 B) 与 (A5, 某个 B)：A 差 5 > 4 允许；
+    # 两次分组共 4 个命中 = 40
+    assert got["best_score"] == 40
+    # 两个 A 命中必然各自入组（member 次数 = 总方案数）
+    total = got["total_count"]
+    assert got["member_count"][0] == total
+    assert got["member_count"][5] == total
+    # 它们探测器相同，从不在同一事件中
+    assert (0, 5) not in got["pair_count"]
+
+
+def test_dead_time_attribution_recomputed_over_optima():
+    # 恢复期改变最优解集合：任一事件占用 A、B 后，同探测器在恢复结束
+    # （t 差 ≤ 3）前不得再分组，故最优只能是单个二元事件；
+    # 四个候选事件各占一个最优解 -> 跨探测器对均为 optional。
+    times = [0, 1, 2, 3]
+    detectors = [0, 1, 0, 1]
+    weights = [1, 1, 1, 1]
+    got = solve(
+        times, detectors, weights, 3, id_order=_ids(4),
+        dead_times=[3, 3],
+    )
+    assert got["total_count"] == 4
+    assert got["best_events"] == 1
+    for pair in ((0, 1), (0, 3), (1, 2), (2, 3)):
+        assert got["pair_count"][pair] == 1
+    # 规范裁决取成员标识序列最小者
+    assert got["canonical"] == [(0, 1)]
+
+
+def test_dead_time_full_scale_performance():
+    rng = random.Random(909)
+    n = 80
+    window = 5
+    times = []
+    t = 0
+    while len(times) < n:
+        window_count = sum(1 for x in times if t - window <= x <= t)
+        if window_count < 10:
+            times.append(t)
+            if rng.random() < 0.5:
+                t += 1
+        else:
+            t += 1
+    times.sort()
+    detectors = [rng.randrange(8) for _ in range(n)]
+    weights = [rng.randint(1, 100) for _ in range(n)]
+    dead = [rng.randint(0, window) for _ in range(8)]
+    start = time.perf_counter()
+    got = solve(
+        times, detectors, weights, window, id_order=_ids(n),
+        dead_times=dead,
+    )
+    elapsed = time.perf_counter() - start
+    assert elapsed < 10.0, f"solve too slow: {elapsed:.2f}s"
+    assert got["best_score"] > 0
+    assert isinstance(got["total_count"], int) and got["total_count"] >= 1
+    # 规范解本身必须满足恢复约束（事件按标识排序，逐探测器收集时刻）
+    times_by_det = {d: [] for d in range(8)}
+    for g in got["canonical"]:
+        for j in g:
+            times_by_det[detectors[j]].append(times[j])
+    for d, ts in times_by_det.items():
+        ts.sort()
+        for a, b in zip(ts, ts[1:]):
+            assert b - a > dead[d], f"detector {d}: {b}-{a} <= {dead[d]}"

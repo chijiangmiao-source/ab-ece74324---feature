@@ -63,6 +63,41 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
             seen.add(det)
             det_values.append(det)
 
+    # 可选：与 detectors 对齐的非负整数恢复期，各值不得大于 window。
+    # 缺省（字段不存在）时保持无恢复期语义；非法值按 dead_times[k]
+    # 下标报错，且不夹带任何结果。
+    dead_times = payload.get("dead_times")
+    dead_values: List[Any] = []
+    if "dead_times" in payload:
+        if not isinstance(dead_times, list):
+            errors.append(
+                {"path": "dead_times", "message": "dead_times must be an array"}
+            )
+        elif "detectors" not in payload or not isinstance(detectors, list) \
+                or len(dead_times) != len(detectors):
+            errors.append({
+                "path": "dead_times",
+                "message": "dead_times length must match detectors",
+            })
+        else:
+            for k, dt in enumerate(dead_times):
+                if not _is_int(dt) or dt < 0:
+                    errors.append({
+                        "path": f"dead_times[{k}]",
+                        "message": "dead time must be a non-negative integer",
+                    })
+                    continue
+                if _is_int(window) and window >= 0 and dt > window:
+                    errors.append({
+                        "path": f"dead_times[{k}]",
+                        "message": "dead time must not exceed the coincidence window",
+                    })
+                    continue
+                dead_values.append(dt)
+            # 保持与 detectors 等长（即使个别元素非法），避免下游错位
+            if len(dead_values) != len(dead_times):
+                dead_values = []
+
     hits = payload.get("hits")
     clean_hits: List[Dict[str, Any]] = []
     if "hits" not in payload:
@@ -140,7 +175,12 @@ def _validate(payload: Any) -> Tuple[List[Dict[str, str]], Dict[str, Any] | None
     if errors:
         return errors, None
 
-    clean = {"window": window, "detectors": det_values, "hits": clean_hits}
+    clean = {
+        "window": window,
+        "detectors": det_values,
+        "hits": clean_hits,
+        "dead_times": dead_values if "dead_times" in payload else None,
+    }
     return [], clean
 
 
@@ -157,7 +197,14 @@ def _run(clean: Dict[str, Any]) -> Dict[str, Any]:
     weights = [h["confidence"] for h in sorted_hits]
     ids = [h["id"] for h in sorted_hits]
 
-    result = solve(times, detectors, weights, window, id_order=ids)
+    result = solve(
+        times,
+        detectors,
+        weights,
+        window,
+        id_order=ids,
+        dead_times=clean.get("dead_times"),
+    )
 
     canonical_groups = [
         sorted(ids[j] for j in group) for group in result["canonical"]

@@ -128,3 +128,168 @@ def test_audit_solution_count_is_string(client):
     # 任意精度以字符串传输
     assert isinstance(data["solution_count"], str)
     int(data["solution_count"])
+
+
+# ---------------------------------------------------- 恢复期（dead_times）
+
+
+def test_dead_times_basic(client):
+    # A@0-B@1 与 A@2-B@3：无恢复期可组两个事件；
+    # d=2（边界相等冲突）使任一事件的两探测器在 t=3 前都无法再分组，
+    # 故最优只能保留单个二元事件（共 4 个候选，各占一个最优解）。
+    payload = {
+        "window": 3,
+        "detectors": ["A", "B"],
+        "dead_times": [2, 2],
+        "hits": [
+            {"id": "a1", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "b1", "detector": "B", "time": 1, "confidence": 5},
+            {"id": "a2", "detector": "A", "time": 2, "confidence": 5},
+            {"id": "b2", "detector": "B", "time": 3, "confidence": 5},
+        ],
+    }
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["optimal_confidence"] == 10
+    assert data["event_count"] == 1
+    assert data["solution_count"] == "4"
+    rel = {(r["a"], r["b"]): r["relation"] for r in data["pair_relations"]}
+    # 四个跨探测器候选事件各恰在一个最优解中
+    assert rel[("a1", "b1")] == "optional"
+    assert rel[("b1", "a2")] == "optional"
+    assert rel[("a1", "b2")] == "optional"
+    assert rel[("a2", "b2")] == "optional"
+    # 规范裁决取成员标识序列最小者
+    assert data["canonical_groups"] == [["a1", "b1"]]
+
+
+def test_dead_times_gap_strictly_greater(client):
+    payload = {
+        "window": 3,
+        "detectors": ["A", "B"],
+        "dead_times": [2, 2],
+        "hits": [
+            {"id": "a1", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "b1", "detector": "B", "time": 0, "confidence": 5},
+            {"id": "a2", "detector": "A", "time": 3, "confidence": 5},
+            {"id": "b2", "detector": "B", "time": 3, "confidence": 5},
+        ],
+    }
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    # 间隔 3 > 2：两个事件都可保留
+    assert data["optimal_confidence"] == 20
+    assert data["event_count"] == 2
+
+
+def test_dead_times_omitted_keeps_old_semantics(client):
+    payload = {
+        "window": 3,
+        "detectors": ["A", "B"],
+        "hits": [
+            {"id": "a1", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "b1", "detector": "B", "time": 1, "confidence": 5},
+            {"id": "a2", "detector": "A", "time": 2, "confidence": 5},
+            {"id": "b2", "detector": "B", "time": 3, "confidence": 5},
+        ],
+    }
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["optimal_confidence"] == 20
+    assert data["event_count"] == 2
+    # 响应不含恢复期相关字段
+    assert "dead_times" not in data
+
+
+def test_dead_times_zero(client):
+    # 显式 0：同刻同探测器命中不得分属两个事件
+    payload = {
+        "window": 0,
+        "detectors": ["A", "B"],
+        "dead_times": [0, 0],
+        "hits": [
+            {"id": "a1", "detector": "A", "time": 0, "confidence": 1},
+            {"id": "a2", "detector": "A", "time": 0, "confidence": 1},
+            {"id": "b1", "detector": "B", "time": 0, "confidence": 1},
+            {"id": "b2", "detector": "B", "time": 0, "confidence": 1},
+        ],
+    }
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["optimal_confidence"] == 2
+    assert data["event_count"] == 1
+
+
+def test_dead_times_not_array(client):
+    payload = _payload()
+    payload["dead_times"] = 3
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert any(e["path"] == "dead_times" for e in data["errors"])
+    assert "optimal_confidence" not in data
+
+
+def test_dead_times_length_mismatch(client):
+    payload = _payload()
+    payload["dead_times"] = [1]
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    paths = {e["path"] for e in resp.get_json()["errors"]}
+    assert "dead_times" in paths
+    # 缺字段的请求行为不变：不会出现 dead_times 错误
+    ok = client.post("/audit", json=_payload())
+    assert ok.status_code == 200
+
+
+def test_dead_times_negative_and_non_integer(client):
+    payload = _payload()
+    payload["dead_times"] = [-1, "x", True]
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    paths = {e["path"] for e in resp.get_json()["errors"]}
+    assert "dead_times[0]" in paths
+    assert "dead_times[1]" in paths
+    assert "dead_times[2]" in paths  # 布尔值不得当作整数
+
+
+def test_dead_times_exceeds_window(client):
+    payload = _payload()
+    payload["dead_times"] = [3, 1, 0]
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    paths = {e["path"] for e in resp.get_json()["errors"]}
+    assert "dead_times[0]" in paths
+    assert "dead_times[1]" not in paths
+    assert "dead_times[2]" not in paths
+
+
+def test_dead_times_equal_window_allowed(client):
+    payload = _payload()
+    payload["dead_times"] = [2, 2, 2]
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 200
+
+
+def test_dead_times_errors_reported_by_index_without_results(client):
+    payload = {
+        "window": 2,
+        "detectors": ["A", "B", "C"],
+        "dead_times": [1, -5, 9],
+        "hits": [
+            {"id": "h1", "detector": "A", "time": 0, "confidence": 5},
+            {"id": "h2", "detector": "B", "time": 1, "confidence": 7},
+            {"id": "h3", "detector": "C", "time": 1, "confidence": 3},
+            {"id": "h4", "detector": "A", "time": 9, "confidence": 4},
+        ],
+    }
+    resp = client.post("/audit", json=payload)
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert "optimal_confidence" not in data
+    paths = {e["path"] for e in data["errors"]}
+    assert paths == {"dead_times[1]", "dead_times[2]"}
